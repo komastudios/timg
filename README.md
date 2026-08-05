@@ -9,7 +9,6 @@ Terminal Image and Video Viewer
 [![macOS Build](../../workflows/macOS%20Build/badge.svg)](../../actions/workflows/macos.yml)
 [![macOS Brew Building HEAD](../../workflows/macOS%20Brew%20Building%20HEAD/badge.svg)](../../actions/workflows/macos-brew.yml)
 
-
 ### https://timg.sh/
 
 A user-friendly terminal image viewer that uses graphic capabilities of
@@ -603,6 +602,77 @@ make
 
 # After compilation, you can run from build/src/timg or install on your system with
 sudo make install
+```
+
+#### Build a static musl binary (minimal dependencies)
+
+`timg` can be built as a fully static binary with musl. A helper script is
+included to do this in a reproducible way:
+
+```bash
+./scripts/build-musl-static.sh
+```
+
+To force building in an Alpine Docker container (the default uses a local
+musl toolchain):
+
+```bash
+USE_DOCKER=1 ./scripts/build-musl-static.sh
+```
+
+Video decoding is enabled by default. To build without it:
+
+```bash
+WITH_VIDEO=0 ./scripts/build-musl-static.sh
+```
+
+Control turbojpeg mode:
+
+```bash
+# Default: auto-detect static libturbojpeg/libexif and enable when available.
+TURBOJPEG_MODE=auto ./scripts/build-musl-static.sh
+
+# Force on/off.
+TURBOJPEG_MODE=on ./scripts/build-musl-static.sh
+TURBOJPEG_MODE=off ./scripts/build-musl-static.sh
+```
+
+What this does:
+
+* Uses `cmake/toolchains/musl-static-minimal.cmake` to force static linking.
+* Builds with a mostly-minimal feature set and keeps JPEG support via STB
+  (`WITH_STB_IMAGE=On`).
+* `TURBOJPEG_MODE=auto` (default) enables optimized JPEG decoding when static
+  `libturbojpeg.a` and `libexif.a` are available.
+* Disables GraphicsMagick, librsvg, openslide and libsixel to avoid
+  requiring many static third-party libraries.
+* Video decoding is on by default; disable it with `WITH_VIDEO=0`.
+* Optional video-device support is on by default; disable it with
+  `WITH_VIDEO_DEVICE=0` (only meaningful with `WITH_VIDEO=1`).
+* PDF rendering via poppler/cairo is on by default; disable it with
+  `WITH_PDF=0`.
+* By default (`USE_DOCKER=0`) the script builds with a local musl C++
+  toolchain (`x86_64-linux-musl-g++`), which must be on `PATH`. Set
+  `USE_DOCKER=1` to build in an Alpine Docker container instead.
+* Setting `DOCKER_PLATFORM` (e.g. `linux/arm64`) implies `USE_DOCKER=1`,
+  since cross-builds can only run in Docker.
+* In the Alpine Docker path, `WITH_VIDEO=1` triggers a local static FFmpeg
+  build from source (installed in `/opt/ffmpeg-static` inside the container).
+* In the Alpine Docker path, `WITH_PDF=1` (default) builds poppler and
+  cairo from source into `/opt/pdf-static`. With the local musl toolchain
+  (`USE_DOCKER=0`), a prebuilt static poppler/cairo stack there is expected
+  instead; set `WITH_PDF=0` if unavailable.
+
+Resulting binary:
+
+* `build-musl-static/src/timg`
+* The script also prints a feature summary from `timg --version` after build.
+
+Quick verification:
+
+```bash
+file build-musl-static/src/timg
+ldd build-musl-static/src/timg  # should print "not a dynamic executable"
 ```
 
 [24-bit-term]: https://gist.github.com/XVilka/8346728
