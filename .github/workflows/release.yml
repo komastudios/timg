@@ -24,9 +24,6 @@ name: release
 on:
   push:
     tags: ['v*.*.*']
-    # TEMPORARY while iterating pre-merge: branch pushes run a dry build.
-    # Remove before merging.
-    branches: ['feat/release-workflow']
   workflow_dispatch:
     inputs:
       version:
