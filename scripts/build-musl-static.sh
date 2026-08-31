@@ -347,6 +347,11 @@ else
         export PKG_CONFIG="pkg-config --static"
         export PKG_CONFIG_PATH="${PDF_PREFIX}/lib/pkgconfig"
       fi
+      # The mounted /src belongs to the host user while the container runs as
+      # root; without this git refuses to operate there and the binary falls
+      # back to the versionless "XX.YY.ZZ+" string instead of git describe.
+      git config --global --add safe.directory /src
+
       rm -rf /src/build-musl-static
       if [ -n "${CMAKE_PREFIX_PATH_VALUE}" ]; then
         CMAKE_PREFIX_PATH_ARG="-DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH_VALUE}"

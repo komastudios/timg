@@ -1,0 +1,413 @@
+# Prebuilt binary releases.
+#
+#   prepare ─ build (4 targets) ─ package ─ publish
+#
+# prepare: resolve the version, tag and commit, then refuse to go further if the
+#          version disagrees with CMakeLists.txt or the tag points at another
+#          commit. Runs before the builds so a bad version costs seconds.
+# build:   one tarball per target. The Linux legs are fully static musl builds
+#          made in Alpine Docker by scripts/build-musl-static.sh; the macOS legs
+#          link all third-party libraries statically via
+#          scripts/build-macos-portable.sh. Every leg runs on hardware matching
+#          its target, so each one smoke tests what it built.
+# package: collect the tarballs, assert the expected asset set and write ONE
+#          aggregated SHA256SUMS over all of them, then render the release
+#          notes. Runs on every trigger, so a dry run exercises everything
+#          except the upload.
+# publish: a single `gh release create`. No checkout, no build tools, no
+#          third-party action — it is the only job holding contents: write.
+#
+# Releases are cut for an explicitly chosen commit: either a pushed v*.*.* tag,
+# or a manual dispatch naming a ref and version. Nothing publishes automatically.
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, e.g. 1.6.3 (empty = read from CMakeLists.txt)
+        type: string
+        default: ''
+      ref:
+        description: Commit SHA or branch to build (empty = the ref selected above)
+        type: string
+        default: ''
+      dry_run:
+        description: Build and package the assets but do not publish a release
+        type: boolean
+        default: true
+
+# contents stays read for the whole workflow; only the job that cuts the release
+# gets write, so a compromised build stage cannot push to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      tag_exists: ${{ steps.resolve.outputs.tag_exists }}
+      release_exists: ${{ steps.probe.outputs.release_exists }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # On a tag push `inputs` is null, so this falls through to github.ref.
+          ref: ${{ inputs.ref || github.ref }}
+          # Needed to resolve an existing tag, and to accept a bare SHA input.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: resolve
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          CMAKE_VERSION="$(sed -nE \
+            's/^project\(timg VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' \
+            CMakeLists.txt)"
+          [ -n "$CMAKE_VERSION" ] || {
+            echo "::error::could not parse the project version from CMakeLists.txt"; exit 1; }
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"; VERSION="${TAG#v}"; SOURCE="tag $TAG"
+          else
+            VERSION="${IN_VERSION:-$CMAKE_VERSION}"; TAG="v$VERSION"; SOURCE="dispatch input"
+          fi
+
+          # The binary reports the CMakeLists.txt version (via git describe of
+          # the v$VERSION tag); a release naming anything else would contradict it.
+          if [ "$VERSION" != "$CMAKE_VERSION" ]; then
+            echo "::error::$SOURCE says $VERSION but CMakeLists.txt says $CMAKE_VERSION"
+            exit 1
+          fi
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::version '$VERSION' is not X.Y.Z"; exit 1 ;;
+          esac
+
+          # Test the event first: on a tag push IN_DRY_RUN is empty, never
+          # 'false'. Only a pushed *tag* publishes; a pushed branch never does.
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            PUBLISH=true
+          elif [ "${IN_DRY_RUN:-}" = "false" ]; then
+            PUBLISH=true
+          else
+            PUBLISH=false
+          fi
+
+          SHA="$(git rev-parse HEAD)"
+
+          # `gh release create --target` is silently ignored when the tag already
+          # exists, so a tag pointing elsewhere would attach these binaries to a
+          # different commit without any error. Refuse instead.
+          if git rev-parse -q --verify "refs/tags/$TAG^{commit}" >/dev/null; then
+            TAG_EXISTS=true
+            TAG_SHA="$(git rev-parse "refs/tags/$TAG^{commit}")"
+            if [ "$TAG_SHA" != "$SHA" ]; then
+              echo "::error::tag $TAG is at $TAG_SHA but this run builds $SHA"
+              exit 1
+            fi
+          else
+            TAG_EXISTS=false
+          fi
+
+          { echo "version=$VERSION"; echo "tag=$TAG"; echo "sha=$SHA"
+            echo "publish=$PUBLISH"; echo "tag_exists=$TAG_EXISTS"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - id: probe
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This repository is a fork, and gh resolves a fork's default repo to
+          # its parent; without this it would read the parent's releases and try
+          # to publish there. Set on every step that shells out to gh.
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          PUBLISH: ${{ steps.resolve.outputs.publish }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then EXISTS=true; else EXISTS=false; fi
+          echo "release_exists=$EXISTS" | tee -a "$GITHUB_OUTPUT"
+          if [ "$EXISTS" = "true" ] && [ "$PUBLISH" = "true" ]; then
+            echo "::error::release $TAG already exists; delete it or re-run with dry_run=true"
+            exit 1
+          fi
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          PUBLISH: ${{ steps.resolve.outputs.publish }}
+          TAG_EXISTS: ${{ steps.resolve.outputs.tag_exists }}
+        run: |
+          {
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| version | \`$VERSION\` |"
+            echo "| tag | \`$TAG\` (exists: $TAG_EXISTS) |"
+            echo "| commit | \`$SHA\` |"
+            echo "| publish | $PUBLISH |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every leg runs on hardware matching its target, so each one can
+          # execute and smoke test what it built. The Linux builds run inside
+          # Alpine Docker natively — no QEMU, the arm64 leg is an arm64 runner.
+          - target: linux-x86_64
+            os: ubuntu-24.04
+            docker_platform: linux/amd64
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            docker_platform: linux/arm64
+          - target: macos-x86_64
+            os: macos-15-intel
+          - target: macos-arm64
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Always the resolved commit, never a branch that could move mid-run.
+          ref: ${{ needs.prepare.outputs.sha }}
+          # Full history and tags, so the binary's git-describe version is real.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Build static musl binary (Linux)
+        if: startsWith(matrix.target, 'linux-')
+        env:
+          DOCKER_PLATFORM: ${{ matrix.docker_platform }}
+        run: |
+          set -euo pipefail
+          TURBOJPEG_MODE=on \
+          WITH_VIDEO=1 \
+          WITH_VIDEO_DEVICE=1 \
+          WITH_PDF=1 \
+            ./scripts/build-musl-static.sh
+          file build-musl-static/src/timg | grep -q 'statically linked'
+          install -m 0755 build-musl-static/src/timg timg-built
+          # Local builds keep their symbols; release downloads should not
+          # carry ~45MB of debug_info. Stripped before the smoke test, so
+          # what gets tested is exactly what ships.
+          strip timg-built
+          ls -l timg-built
+
+      - name: Install macOS build tools
+        if: startsWith(matrix.target, 'macos-')
+        # nasm: libjpeg-turbo and FFmpeg SIMD on x86_64. Everything else the
+        # dependency builds need (cmake, make, clang, git) is on the image.
+        run: brew install nasm
+
+      - name: Build portable binary (macOS)
+        if: startsWith(matrix.target, 'macos-')
+        run: |
+          set -euo pipefail
+          ./scripts/build-macos-portable.sh
+          install -m 0755 build-macos-portable/src/timg timg-built
+          # Stripped before the smoke test: on arm64 strip must preserve a
+          # valid ad-hoc code signature or the binary would not run at all.
+          strip timg-built
+          ls -l timg-built
+
+      - name: Smoke test
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ./timg-built --version
+          out="$(./timg-built --version)"
+          echo "$out" | grep -q 'Turbo JPEG'
+          echo "$out" | grep -q 'Video decoding'
+          case "$TARGET" in
+            linux-*) echo "$out" | grep -q 'PDF rendering with poppler' ;;
+          esac
+          # Only a build of the tagged commit carries the exact version; branch
+          # and dry-run builds report whatever git describe finds there.
+          if [ "$TAG_EXISTS" = "true" ]; then
+            first="$(echo "$out" | head -1)"
+            case "$first" in
+              "timg v$VERSION"*|"timg $VERSION"*) ;;
+              *) echo "::error::version line '$first' does not match $VERSION"; exit 1 ;;
+            esac
+          fi
+
+      - name: Package tarball
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          # No AppleDouble ._* members from bsdtar on the macOS legs.
+          export COPYFILE_DISABLE=1
+          NAME="timg-$TAG-$TARGET"
+          mkdir -p "dist/$NAME"
+          install -m 0755 timg-built "dist/$NAME/timg"
+          tar -C dist -czf "dist/$NAME.tar.gz" "$NAME"
+          rm -rf "dist/$NAME"
+          ls -l dist
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@v7
+        with:
+          # Unique per leg: upload-artifact rejects a repeated name outright.
+          name: timg-${{ matrix.target }}
+          path: dist/timg-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    name: package and checksum
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: timg-*
+          # Without this, each artifact lands nested under dist/<artifact-name>/.
+          merge-multiple: true
+          path: dist
+
+      - name: Check the asset set
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          for t in linux-x86_64 linux-arm64 macos-x86_64 macos-arm64; do
+            [ -f "dist/timg-$TAG-$t.tar.gz" ] || {
+              echo "::error::missing asset timg-$TAG-$t.tar.gz"; ls -l dist; exit 1; }
+          done
+          n="$(find dist -maxdepth 1 -type f | wc -l)"
+          if [ "$n" -ne 4 ]; then
+            echo "::error::expected exactly 4 assets, found $n"; ls -l dist; exit 1
+          fi
+          ls -l dist
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          # Hashed from inside dist so the manifest lists bare filenames, and
+          # written outside it first so it cannot hash itself.
+          ( cd dist && find . -maxdepth 1 -type f -printf '%f\n' \
+              | LC_ALL=C sort | xargs sha256sum ) > SHA256SUMS
+          mv SHA256SUMS dist/
+          cat dist/SHA256SUMS
+
+      - name: Release notes
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Prebuilt \`timg\` binaries from the komastudios fork."
+            echo
+            echo '## Feature set'
+            echo
+            echo 'All four targets share the same core: JPEG loading via libjpeg-turbo +'
+            echo 'libexif, general image loading via STB (PNG, GIF, BMP, ...), QOI images,'
+            echo 'terminal graphics compression via libdeflate, and video decoding via a'
+            echo 'statically linked FFmpeg 6.1.1.'
+            echo
+            echo '- **Linux** (`linux-x86_64`, `linux-arm64`): fully static musl binaries'
+            echo '  that run on any distribution. They additionally carry PDF rendering'
+            echo '  (poppler + cairo) and v4l2 video device input.'
+            echo '- **macOS** (`macos-arm64`, `macos-x86_64`): all third-party libraries'
+            echo '  statically linked; the binaries depend only on macOS system libraries'
+            echo '  and run on macOS 11.0 or newer. No PDF rendering (a static'
+            echo '  poppler/glib stack is impractical on macOS) and no video device input.'
+            echo
+            echo 'Not compiled in on any target: GraphicsMagick, librsvg (SVG), OpenSlide,'
+            echo 'libsixel.'
+            echo
+            echo '## Downloads'
+            echo
+            echo 'Every asset follows the same pattern and unpacks to a single binary:'
+            echo "\`timg-$TAG-<target>.tar.gz\` → \`timg-$TAG-<target>/timg\`"
+            echo
+            echo '```sh'
+            echo "curl -LO $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$TAG/timg-$TAG-linux-x86_64.tar.gz"
+            echo "tar xzf timg-$TAG-linux-x86_64.tar.gz"
+            echo "timg-$TAG-linux-x86_64/timg --version"
+            echo '```'
+            echo
+            echo '### SHA256'
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo "Built from \`$SHA\` by [run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)."
+          } > dist/notes.md
+          cat dist/notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [prepare, package]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+          TAG_EXISTS: ${{ needs.prepare.outputs.tag_exists }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists; not republishing" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          args=( "$TAG" --title "$TAG" --notes-file dist/notes.md )
+          if [ "$TAG_EXISTS" = "true" ]; then
+            # Tag-push path: the tag is already there and --target would be ignored.
+            args+=( --verify-tag )
+          else
+            # Dispatch path: gh creates the tag at exactly the commit we built.
+            args+=( --target "$SHA" )
+          fi
+          # Explicit globs: a bare dist/* would upload notes.md as a sixth asset.
+          gh release create "${args[@]}" dist/timg-*.tar.gz dist/SHA256SUMS
+          echo "published $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
