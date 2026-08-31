@@ -211,6 +211,11 @@ jobs:
             ./scripts/build-musl-static.sh
           file build-musl-static/src/timg | grep -q 'statically linked'
           install -m 0755 build-musl-static/src/timg timg-built
+          # Local builds keep their symbols; release downloads should not
+          # carry ~45MB of debug_info. Stripped before the smoke test, so
+          # what gets tested is exactly what ships.
+          strip timg-built
+          ls -l timg-built
 
       - name: Install macOS build tools
         if: startsWith(matrix.target, 'macos-')
@@ -224,6 +229,10 @@ jobs:
           set -euo pipefail
           ./scripts/build-macos-portable.sh
           install -m 0755 build-macos-portable/src/timg timg-built
+          # Stripped before the smoke test: on arm64 strip must preserve a
+          # valid ad-hoc code signature or the binary would not run at all.
+          strip timg-built
+          ls -l timg-built
 
       - name: Smoke test
         env:
