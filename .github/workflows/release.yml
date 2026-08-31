@@ -24,6 +24,9 @@ name: release
 on:
   push:
     tags: ['v*.*.*']
+    # TEMPORARY while iterating pre-merge: branch pushes run a dry build.
+    # Remove before merging.
+    branches: ['feat/release-workflow']
   workflow_dispatch:
     inputs:
       version:
@@ -99,10 +102,14 @@ jobs:
             *) echo "::error::version '$VERSION' is not X.Y.Z"; exit 1 ;;
           esac
 
-          # Test the event first: on a tag push IN_DRY_RUN is empty, never 'false'.
-          if   [ "$GITHUB_EVENT_NAME" = "push" ]; then PUBLISH=true
-          elif [ "${IN_DRY_RUN:-}" = "false" ];   then PUBLISH=true
-          else                                         PUBLISH=false
+          # Test the event first: on a tag push IN_DRY_RUN is empty, never
+          # 'false'. Only a pushed *tag* publishes; a pushed branch never does.
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            PUBLISH=true
+          elif [ "${IN_DRY_RUN:-}" = "false" ]; then
+            PUBLISH=true
+          else
+            PUBLISH=false
           fi
 
           SHA="$(git rev-parse HEAD)"
