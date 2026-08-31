@@ -21,7 +21,7 @@ JOBS="${JOBS:-$(sysctl -n hw.ncpu)}"
 
 LIBDEFLATE_VERSION="${LIBDEFLATE_VERSION:-1.20}"
 LIBJPEG_TURBO_VERSION="${LIBJPEG_TURBO_VERSION:-3.0.3}" # as build-musl-static.sh
-LIBEXIF_VERSIONS="0.6.25 0.6.24"                        # as build-musl-static.sh
+LIBEXIF_VERSION="${LIBEXIF_VERSION:-0.6.25}"            # as build-musl-static.sh
 FFMPEG_VERSION="${FFMPEG_VERSION:-n6.1.1}"              # as build-musl-static.sh
 
 # Build for old macOS, not just the builder's OS version. 11.0 is the oldest
@@ -64,17 +64,11 @@ if [ ! -f "${DEPS_PREFIX}/lib/libturbojpeg.a" ]; then
 fi
 
 if [ ! -f "${DEPS_PREFIX}/lib/libexif.a" ]; then
-  echo "=== Building static libexif"
-  LIBEXIF_TARBALL="${DEPS_SRC}/libexif.tar"
-  for v in ${LIBEXIF_VERSIONS}; do
-    if curl -fsSL -o "${LIBEXIF_TARBALL}" \
-      "https://deb.debian.org/debian/pool/main/libe/libexif/libexif_${v}.orig.tar.gz"; then
-      break
-    fi
-  done
-  [ -s "${LIBEXIF_TARBALL}" ] || { echo "Failed to download libexif" >&2; exit 2; }
-  mkdir -p "${DEPS_SRC}/libexif"
-  tar xf "${LIBEXIF_TARBALL}" -C "${DEPS_SRC}/libexif" --strip-components=1
+  echo "=== Building static libexif ${LIBEXIF_VERSION}"
+  # The official dist tarball, not a git snapshot: it ships a generated
+  # ./configure, so no autotools are needed on the build machine.
+  fetch_tar "https://github.com/libexif/libexif/releases/download/v${LIBEXIF_VERSION}/libexif-${LIBEXIF_VERSION}.tar.bz2" \
+    "${DEPS_SRC}/libexif"
   ( cd "${DEPS_SRC}/libexif" \
     && ./configure --prefix="${DEPS_PREFIX}" \
          --enable-static --disable-shared --disable-nls \
